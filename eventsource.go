@@ -154,8 +154,13 @@ func (es *eventSource) Close() {
 }
 
 // ServeHTTP implements http.Handler interface.
-func (es *eventSource) ServeHTTP(resp http.ResponseWriter, req *http.Request) {
-	cons, err := newConsumer(resp, req, es)
+func (es *eventSource) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Accept") != "text/event-stream" {
+		w.WriteHeader(http.StatusNotAcceptable)
+		fmt.Fprint(w, "Should accept text/event-stream")
+		return
+	}
+	cons, err := newConsumer(w, r, es)
 	if err != nil {
 		log.Print("Can't create connection to a consumer: ", err)
 		return
