@@ -4,14 +4,12 @@ import (
 	"bytes"
 	"container/list"
 	"fmt"
-	"log"
 	"net/http"
 	"strings"
 	"time"
 )
 
 type eventMessage struct {
-	id    string
 	event string
 	data  string
 }
@@ -23,6 +21,9 @@ type eventSource struct {
 	staled         chan *consumer
 	add            chan *consumer
 	close          chan bool
+	history        [][]byte
+	historySize    int
+	lastId         int
 	timeout        time.Duration
 	closeOnTimeout bool
 
@@ -44,12 +45,16 @@ type Settings struct {
 	//
 	// The default is true.
 	CloseOnTimeout bool
+
+	// Size of the history of messages. The default is 100 messages.
+	HistorySize int
 }
 
 func DefaultSettings() *Settings {
 	return &Settings{
 		Timeout:        2 * time.Second,
 		CloseOnTimeout: true,
+		HistorySize:    10,
 	}
 }
 
@@ -59,7 +64,7 @@ type EventSource interface {
 	http.Handler
 
 	// send message to all consumers
-	SendMessage(data, event, id string)
+	SendMessage(data, event string)
 
 	// consumers count
 	ConsumersCount() int
@@ -68,10 +73,10 @@ type EventSource interface {
 	Close()
 }
 
-func prepareMessage(m *eventMessage) []byte {
+func prepareMessage(id int, m *eventMessage) []byte {
 	var data bytes.Buffer
-	if len(m.id) > 0 {
-		data.WriteString(fmt.Sprintf("id: %s\n", strings.Replace(m.id, "\n", "", -1)))
+	if id >= 0 {
+		data.WriteString(fmt.Sprintf("id: %d\n", id))
 	}
 	if len(m.event) > 0 {
 		data.WriteString(fmt.Sprintf("event: %s\n", strings.Replace(m.event, "\n", "", -1)))
@@ -86,21 +91,63 @@ func prepareMessage(m *eventMessage) []byte {
 	return data.Bytes()
 }
 
-func controlProcess(es *eventSource) {
+func sendConsumer(c *consumer, b []byte) {
+	if !c.staled {
+		select {
+		case c.in <- b:
+		default:
+		}
+	}
+}
+
+func (es *eventSource) prepareEvent(id int, ms *eventMessage) []byte {
+	b := prepareMessage(id, ms)
+	h := es.history
+	if len(h) < es.historySize {
+		es.history = append(h, b)
+	} else {
+		es.history = append(h[1:], b)
+	}
+	es.lastId = id
+	return b
+}
+
+func (es *eventSource) sendMissedEvents(c *consumer) {
+	if c.lastId >= 0 {
+		h := es.history
+		i := c.lastId - (es.lastId - len(h))
+		if i < 0 {
+			i = 0
+		}
+		for ; i < len(es.history); i++ {
+			sendConsumer(c, h[i])
+		}
+	}
+}
+
+func (es *eventSource) removeStaled(c *consumer) {
+	toRemoveEls := make([]*list.Element, 0, 1)
+	for e := es.consumers.Front(); e != nil; e = e.Next() {
+		if e.Value.(*consumer) == c {
+			toRemoveEls = append(toRemoveEls, e)
+		}
+	}
+	for _, e := range toRemoveEls {
+		es.consumers.Remove(e)
+	}
+}
+
+func (es *eventSource) controlProcess() {
+	id := -1
 	for {
 		select {
 		case em := <-es.sink:
-			message := prepareMessage(em)
+			id++
+			ms := es.prepareEvent(id, em)
 			for e := es.consumers.Front(); e != nil; e = e.Next() {
 				c := e.Value.(*consumer)
-
 				// Only send this message if the consumer isn't staled
-				if !c.staled {
-					select {
-					case c.in <- message:
-					default:
-					}
-				}
+				sendConsumer(c, ms)
 			}
 		case <-es.close:
 			close(es.sink)
@@ -115,16 +162,9 @@ func controlProcess(es *eventSource) {
 			return
 		case c := <-es.add:
 			es.consumers.PushBack(c)
+			es.sendMissedEvents(c)
 		case c := <-es.staled:
-			toRemoveEls := make([]*list.Element, 0, 1)
-			for e := es.consumers.Front(); e != nil; e = e.Next() {
-				if e.Value.(*consumer) == c {
-					toRemoveEls = append(toRemoveEls, e)
-				}
-			}
-			for _, e := range toRemoveEls {
-				es.consumers.Remove(e)
-			}
+			es.removeStaled(c)
 			close(c.in)
 		}
 	}
@@ -142,10 +182,13 @@ func New(settings *Settings, customHeadersFunc func(*http.Request) [][]byte) Eve
 	es.close = make(chan bool)
 	es.staled = make(chan *consumer, 1)
 	es.add = make(chan *consumer)
+	es.history = make([][]byte, 0)
+	es.historySize = settings.HistorySize
 	es.consumers = list.New()
 	es.timeout = settings.Timeout
 	es.closeOnTimeout = settings.CloseOnTimeout
-	go controlProcess(es)
+
+	go es.controlProcess()
 	return es
 }
 
@@ -162,19 +205,15 @@ func (es *eventSource) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	cons, err := newConsumer(w, r, es)
 	if err != nil {
-		log.Print("Can't create connection to a consumer: ", err)
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, err.Error())
 		return
 	}
 	es.add <- cons
 }
 
-func (es *eventSource) sendEventMessage(e *eventMessage) {
-	es.sink <- e
-}
-
-func (es *eventSource) SendMessage(data, event, id string) {
-	em := &eventMessage{id, event, data}
-	es.sendEventMessage(em)
+func (es *eventSource) SendMessage(data, event string) {
+	es.sink <- &eventMessage{event, data}
 }
 
 func (es *eventSource) ConsumersCount() int {

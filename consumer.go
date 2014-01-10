@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"net"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -12,9 +13,20 @@ type consumer struct {
 	es     *eventSource
 	in     chan []byte
 	staled bool
+	lastId int
 }
 
 func newConsumer(resp http.ResponseWriter, req *http.Request, es *eventSource) (*consumer, error) {
+
+	hid := req.Header.Get("Last-Event-ID")
+	id := -1
+	if len(hid) > 0 {
+		var err error
+		if id, err = strconv.Atoi(hid); err != nil {
+			return nil, err
+		}
+	}
+
 	conn, _, err := resp.(http.Hijacker).Hijack()
 	if err != nil {
 		return nil, err
@@ -25,6 +37,7 @@ func newConsumer(resp http.ResponseWriter, req *http.Request, es *eventSource) (
 		es:     es,
 		in:     make(chan []byte, 10),
 		staled: false,
+		lastId: id,
 	}
 
 	headers := [][]byte{
