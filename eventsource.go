@@ -2,220 +2,196 @@ package eventsource
 
 import (
 	"bytes"
-	"container/list"
 	"fmt"
 	"net/http"
-	"strings"
-	"time"
 )
 
-type eventMessage struct {
+const (
+	consumerBufSize    = 10
+	defaultHistorySize = 50
+)
+
+type consumer struct {
+	id int
+	ch chan []byte
+}
+
+type message struct {
 	event string
-	data  string
+	data  []byte
 }
 
 type eventSource struct {
-	customHeadersFunc func(*http.Request) [][]byte
+	// History of last events.
+	H [][]byte
 
-	sink           chan *eventMessage
-	staled         chan *consumer
-	add            chan *consumer
-	close          chan bool
-	history        [][]byte
-	historySize    int
-	lastId         int
-	timeout        time.Duration
-	closeOnTimeout bool
-
-	consumers *list.List
+	// Value of last event's id sent.
+	id        int
+	sink      chan *message
+	add       chan *consumer
+	remove    chan *consumer
+	close     chan bool
+	consumers map[*consumer]bool
 }
 
-type Settings struct {
-	// SetTimeout sets the write timeout for individual messages. The
-	// default is 2 seconds.
-	Timeout time.Duration
-
-	// CloseOnTimeout sets whether a write timeout should close the
-	// connection or just drop the message.
-	//
-	// If the connection gets closed on a timeout, it's the client's
-	// responsibility to re-establish a connection. If the connection
-	// doesn't get closed, messages might get sent to a potentially dead
-	// client.
-	//
-	// The default is true.
-	CloseOnTimeout bool
-
-	// Size of the history of messages. The default is 100 messages.
-	HistorySize int
-}
-
-func DefaultSettings() *Settings {
-	return &Settings{
-		Timeout:        2 * time.Second,
-		CloseOnTimeout: true,
-		HistorySize:    10,
-	}
-}
-
-// EventSource interface provides methods for sending messages and closing all connections.
+// EventSource interface provides methods for sending messages
+// and closing all connections.
 type EventSource interface {
-	// it should implement ServerHTTP method
+	// It should implement ServerHTTP method.
 	http.Handler
 
-	// send message to all consumers
-	SendMessage(data, event string)
+	// Send message to all consumers.
+	SendMessage(data []byte, event string)
 
-	// consumers count
+	// Curried version of SendMessage, bound
+	// to a unique event namespace
+	Sender(event string) func(data []byte)
+
+	// Consumers count
 	ConsumersCount() int
 
-	// close and clear all consumers
+	// Close and clear all consumers.
 	Close()
+
+	// Subscribe a new consumer to eventsource
+	// wth the given last received event id (or -1)
+	Subscribe(id int) *consumer
+
+	// Unsubscribe the given consumer
+	Unsubscribe(c *consumer)
 }
 
-func prepareMessage(id int, m *eventMessage) []byte {
-	var data bytes.Buffer
-	if id >= 0 {
-		data.WriteString(fmt.Sprintf("id: %d\n", id))
+func newMessage(data []byte, event string) *message {
+	m := &message{
+		event: event,
+		data:  make([]byte, len(data)),
 	}
-	if len(m.event) > 0 {
-		data.WriteString(fmt.Sprintf("event: %s\n", strings.Replace(m.event, "\n", "", -1)))
-	}
-	if len(m.data) > 0 {
-		lines := strings.Split(m.data, "\n")
-		for _, line := range lines {
-			data.WriteString(fmt.Sprintf("data: %s\n", line))
-		}
-	}
-	data.WriteString("\n")
-	return data.Bytes()
+	copy(m.data, data)
+	return m
 }
 
-func sendConsumer(c *consumer, b []byte) {
-	if !c.staled {
-		select {
-		case c.in <- b:
-		default:
-		}
-	}
+func (m *message) prepare(id int) []byte {
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "id: %d\n", id)
+	fmt.Fprintf(&buf, "event: %s\n", m.event)
+	fmt.Fprintf(&buf, "data: %s\n\n", m.data)
+	return buf.Bytes()
 }
 
-func (es *eventSource) prepareEvent(id int, ms *eventMessage) []byte {
-	b := prepareMessage(id, ms)
-	h := es.history
-	if len(h) < es.historySize {
-		es.history = append(h, b)
-	} else {
-		es.history = append(h[1:], b)
-	}
-	es.lastId = id
-	return b
-}
-
-func (es *eventSource) sendMissedEvents(c *consumer) {
-	if c.lastId >= 0 {
-		h := es.history
-		i := c.lastId - (es.lastId - len(h))
-		if i < 0 {
-			i = 0
-		}
-		for ; i < len(es.history); i++ {
-			sendConsumer(c, h[i])
-		}
-	}
-}
-
-func (es *eventSource) removeStaled(c *consumer) {
-	toRemoveEls := make([]*list.Element, 0, 1)
-	for e := es.consumers.Front(); e != nil; e = e.Next() {
-		if e.Value.(*consumer) == c {
-			toRemoveEls = append(toRemoveEls, e)
-		}
-	}
-	for _, e := range toRemoveEls {
-		es.consumers.Remove(e)
-	}
-}
-
-func (es *eventSource) controlProcess() {
-	id := -1
+func (es *eventSource) loop() {
 	for {
 		select {
-		case em := <-es.sink:
-			id++
-			ms := es.prepareEvent(id, em)
-			for e := es.consumers.Front(); e != nil; e = e.Next() {
-				c := e.Value.(*consumer)
-				// Only send this message if the consumer isn't staled
-				sendConsumer(c, ms)
+
+		// New message from the sink, broadcasted to consumers.
+		case m := <-es.sink:
+			b := m.prepare(es.id)
+			for c := range es.consumers {
+				select {
+				case c.ch <- b:
+				default:
+				}
 			}
+			es.appendHistory(b)
+			es.id++
+
+		// New consumer added to consumer list.
+		// Send missed events to the consumer if any.
+		case c := <-es.add:
+			es.consumers[c] = true
+			for _, b := range es.missedEvents(c) {
+				select {
+				case c.ch <- b:
+				default:
+				}
+			}
+
+		// Remove one consumer.
+		case c := <-es.remove:
+			delete(es.consumers, c)
+			close(c.ch)
+
+		// Close eventsource's channels and consumers.
 		case <-es.close:
 			close(es.sink)
 			close(es.add)
-			close(es.staled)
+			close(es.remove)
 			close(es.close)
-			for e := es.consumers.Front(); e != nil; e = e.Next() {
-				c := e.Value.(*consumer)
-				close(c.in)
+			for c := range es.consumers {
+				close(c.ch)
 			}
-			es.consumers.Init()
+			es.consumers = nil
+			es.H = nil
 			return
-		case c := <-es.add:
-			es.consumers.PushBack(c)
-			es.sendMissedEvents(c)
-		case c := <-es.staled:
-			es.removeStaled(c)
-			close(c.in)
 		}
 	}
 }
 
 // New creates new EventSource instance.
-func New(settings *Settings, customHeadersFunc func(*http.Request) [][]byte) EventSource {
-	if settings == nil {
-		settings = DefaultSettings()
+func New() EventSource {
+	es := &eventSource{
+		H:         make([][]byte, 0, defaultHistorySize),
+		id:        0,
+		sink:      make(chan *message, 1),
+		add:       make(chan *consumer),
+		remove:    make(chan *consumer, 1),
+		close:     make(chan bool),
+		consumers: make(map[*consumer]bool),
 	}
-
-	es := new(eventSource)
-	es.customHeadersFunc = customHeadersFunc
-	es.sink = make(chan *eventMessage, 1)
-	es.close = make(chan bool)
-	es.staled = make(chan *consumer, 1)
-	es.add = make(chan *consumer)
-	es.history = make([][]byte, 0)
-	es.historySize = settings.HistorySize
-	es.consumers = list.New()
-	es.timeout = settings.Timeout
-	es.closeOnTimeout = settings.CloseOnTimeout
-
-	go es.controlProcess()
+	go es.loop()
 	return es
+}
+
+func (es *eventSource) Subscribe(id int) *consumer {
+	c := &consumer{
+		id: id,
+		ch: make(chan []byte, consumerBufSize),
+	}
+	es.add <- c
+	return c
+}
+
+func (es *eventSource) Unsubscribe(c *consumer) {
+	es.remove <- c
 }
 
 func (es *eventSource) Close() {
 	es.close <- true
 }
 
-// ServeHTTP implements http.Handler interface.
-func (es *eventSource) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("Accept") != "text/event-stream" {
-		w.WriteHeader(http.StatusNotAcceptable)
-		fmt.Fprint(w, "Should accept text/event-stream")
-		return
-	}
-	cons, err := newConsumer(w, r, es)
-	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprintf(w, err.Error())
-		return
-	}
-	es.add <- cons
-}
-
-func (es *eventSource) SendMessage(data, event string) {
-	es.sink <- &eventMessage{event, data}
+func (es *eventSource) SendMessage(data []byte, event string) {
+	es.sink <- newMessage(data, event)
 }
 
 func (es *eventSource) ConsumersCount() int {
-	return es.consumers.Len()
+	return len(es.consumers)
+}
+
+func (es *eventSource) Sender(event string) func(data []byte) {
+	return func(data []byte) {
+		es.SendMessage(data, event)
+	}
+}
+
+// ServeHTTP implements http.Handler interface.
+func (es *eventSource) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	consumerHandler(w, r, es)
+}
+
+func (es *eventSource) appendHistory(b []byte) {
+	if len(es.H) < defaultHistorySize {
+		es.H = append(es.H, b)
+	} else {
+		es.H = append(es.H[1:], b)
+	}
+}
+
+func (es *eventSource) missedEvents(c *consumer) [][]byte {
+	if c.id < 0 || c.id >= es.id {
+		return nil
+	}
+	i := c.id - es.id + len(es.H)
+	if i < 0 {
+		i = 0
+	}
+	return es.H[i:]
 }
