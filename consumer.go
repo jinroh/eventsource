@@ -50,11 +50,17 @@ func consumerHandler(w http.ResponseWriter, r *http.Request, es *eventSource) {
 	defer es.Unsubscribe(con)
 
 	for {
-		b := <-con.ch
-		if _, err := w.Write(b); err == nil {
-			fl.Flush()
-		} else {
-			log.Print(err)
+		select {
+		case b := <-con.ch:
+			if _, err := w.Write(b); err == nil {
+				fl.Flush()
+			} else {
+				log.Print(err)
+				return
+			}
+		case <-con.quit:
+			close(con.ch)
+			close(con.quit)
 			return
 		}
 	}

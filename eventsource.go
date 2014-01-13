@@ -12,8 +12,9 @@ const (
 )
 
 type consumer struct {
-	id int
-	ch chan []byte
+	id   int
+	ch   chan []byte
+	quit chan bool
 }
 
 type message struct {
@@ -109,18 +110,17 @@ func (es *eventSource) loop() {
 		case c := <-es.remove:
 			delete(es.consumers, c)
 			close(c.ch)
+			close(c.quit)
 
 		// Close eventsource's channels and consumers.
 		case <-es.close:
 			close(es.sink)
 			close(es.add)
-			close(es.remove)
 			close(es.close)
 			for c := range es.consumers {
-				close(c.ch)
+				c.quit <- true
 			}
-			es.consumers = nil
-			es.H = nil
+			close(es.remove)
 			return
 		}
 	}
@@ -143,8 +143,9 @@ func New() EventSource {
 
 func (es *eventSource) Subscribe(id int) *consumer {
 	c := &consumer{
-		id: id,
-		ch: make(chan []byte, consumerBufSize),
+		id:   id,
+		ch:   make(chan []byte, consumerBufSize),
+		quit: make(chan bool),
 	}
 	es.add <- c
 	return c
