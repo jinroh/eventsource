@@ -99,11 +99,9 @@ func (es *eventSource) loop() {
 		// Send missed events to the consumer if any.
 		case c := <-es.add:
 			es.consumers[c] = true
-			for _, b := range es.missedEvents(c) {
-				select {
-				case c.ch <- b:
-				default:
-				}
+			select {
+			case c.ch <- es.missedEvents(c):
+			default:
 			}
 
 		// Remove one consumer.
@@ -186,7 +184,7 @@ func (es *eventSource) appendHistory(b []byte) {
 	}
 }
 
-func (es *eventSource) missedEvents(c *consumer) [][]byte {
+func (es *eventSource) missedEvents(c *consumer) []byte {
 	if c.id < 0 || c.id >= es.id {
 		return nil
 	}
@@ -194,5 +192,5 @@ func (es *eventSource) missedEvents(c *consumer) [][]byte {
 	if i < 0 {
 		i = 0
 	}
-	return es.H[i:]
+	return bytes.Join(es.H[i:], []byte{})
 }
